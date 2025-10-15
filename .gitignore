@@ -1,0 +1,25 @@
+@'
+# Keep docs folder, ignore its contents
+docs/*
+!docs/.gitkeep
+
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Vector DB & artifacts
+chroma_db/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+*.swp
+
+# Logs
+*.log
+'@ | Set-Content -Encoding UTF8 .gitignore
+
+New-Item -ItemType File -Path .\docs\.gitkeep -Force | Out-Null
+
+*.pdf
