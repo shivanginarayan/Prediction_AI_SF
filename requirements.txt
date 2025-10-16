@@ -1,3 +1,7 @@
 ﻿chromadb==1.1.1
 pypdf==5.1.0
 requests>=2.31.0,<3
+pandas>=1.5,<3
+numpy>=1.23,<3
+scikit-learn>=1.2,<2
+joblib>=1.3,<2

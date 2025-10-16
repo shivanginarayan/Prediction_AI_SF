@@ -23,3 +23,5 @@ Thumbs.db
 New-Item -ItemType File -Path .\docs\.gitkeep -Force | Out-Null
 
 *.pdf
+
+models/model.pkl

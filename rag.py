@@ -3,13 +3,19 @@ import requests
 import chromadb
 from pypdf import PdfReader
 
+# ===== Optional: ML prediction hook =====
+try:
+    from models.predict import predict_from_features  # loads models/model.pkl
+except Exception:
+    predict_from_features = None
+
 # =======================
 # Config
 # =======================
 DOCS_DIR = "docs"
 COLLECTION_NAME = "my_docs"
-EMBED_MODEL = "nomic-embed-text"   
-CHAT_MODEL = "mistral:latest"      
+EMBED_MODEL = "nomic-embed-text"
+CHAT_MODEL = "mistral:latest"
 OLLAMA_URL = "http://localhost:11434"
 
 CHUNK_SIZE = 900
@@ -27,7 +33,6 @@ def normalize_ws(s: str) -> str:
     return re.sub(r"\s+", " ", s).strip()
 
 def file_hash(path: str) -> str:
-    """SHA256 of file bytes to detect changes."""
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for b in iter(lambda: f.read(1 << 20), b""):
@@ -47,13 +52,10 @@ def save_manifest(m: dict) -> None:
         json.dump(m, f)
 
 def read_file(path: str) -> str:
-    """Read .txt/.md/.pdf/.csv into plain text."""
     ext = os.path.splitext(path)[1].lower()
-
     if ext in (".txt", ".md"):
         with open(path, "r", encoding="utf-8", errors="ignore") as f:
             return f.read()
-
     if ext == ".pdf":
         reader = PdfReader(path)
         pages = []
@@ -63,19 +65,15 @@ def read_file(path: str) -> str:
             except Exception:
                 pages.append("")
         return "\n".join(pages)
-
     if ext == ".csv":
         rows = []
         with open(path, newline="", encoding="utf-8", errors="ignore") as f:
             reader = csv.DictReader(f)
             for i, row in enumerate(reader):
-                # Join key: value pairs into a single, human-readable line
                 rows.append(" | ".join(f"{k}: {v}" for k, v in row.items()))
-                if i >= 20000:  # safety cap for huge CSVs; adjust as needed
+                if i >= 20000:
                     break
         return "\n".join(rows)
-
-    # Ignore other types
     return ""
 
 def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
@@ -92,7 +90,6 @@ def chunk_text(text: str, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     return chunks
 
 def ollama_embed(texts):
-    """Embed a list of texts using Ollama's /api/embeddings (one by one)."""
     vectors = []
     for t in texts:
         r = requests.post(
@@ -126,7 +123,6 @@ def ensure_collection():
     return client.get_or_create_collection(name=COLLECTION_NAME)
 
 def trim_context(blocks, max_chars=3500):
-    """Keep adding blocks until ~max_chars to avoid overlong prompts."""
     out, total = [], 0
     for b in blocks:
         if total + len(b) > max_chars and out:
@@ -147,20 +143,15 @@ def build_index():
         for fn in files:
             if not fn.lower().endswith((".txt", ".md", ".pdf", ".csv")):
                 continue
-
             path = os.path.join(root, fn)
             rel = os.path.relpath(path, DOCS_DIR).replace("\\", "/")
-
             try:
                 h = file_hash(path)
             except FileNotFoundError:
                 continue
-
             if manifest.get(rel, {}).get("hash") == h:
-                # unchanged — skip
                 continue
 
-            # read & chunk
             text = read_file(path)
             if not text.strip():
                 continue
@@ -168,29 +159,24 @@ def build_index():
             if not chunks:
                 continue
 
-            # embed (batch in groups to be gentle)
             embeddings = []
             B = 32
             for i in range(0, len(chunks), B):
                 embeddings.extend(ollama_embed(chunks[i:i+B]))
 
-            # deterministic IDs
             ids = [f"{rel}::chunk-{i}" for i in range(len(chunks))]
             metadatas = [{"source": rel, "chunk": i} for i in range(len(chunks))]
 
-            # Upsert (safe if run multiple times)
             col.upsert(documents=chunks, embeddings=embeddings, metadatas=metadatas, ids=ids)
 
-            # If previously had more chunks, delete the extras
             old_count = manifest.get(rel, {}).get("chunks", 0)
             if old_count > len(chunks):
                 extra_ids = [f"{rel}::chunk-{i}" for i in range(len(chunks), old_count)]
                 try:
                     col.delete(ids=extra_ids)
                 except Exception:
-                    pass  # not fatal
+                    pass
 
-            # update manifest
             manifest[rel] = {"hash": h, "chunks": len(chunks)}
             new_or_updated.append(rel)
 
@@ -198,25 +184,22 @@ def build_index():
     return new_or_updated
 
 # =======================
-# Query
+# Query (RAG)
 # =======================
 def answer_question(question: str) -> str:
     col = ensure_collection()
-
     q_embed = ollama_embed([question])[0]
     res = col.query(
         query_embeddings=[q_embed],
         n_results=TOP_K,
         include=["documents", "metadatas", "distances"],
     )
-
     if not res.get("documents") or not res["documents"][0]:
         return "I couldn't find any relevant context in your docs."
 
     docs = res["documents"][0]
     metas = res["metadatas"][0]
 
-    # Build context with a soft cap on total size
     context_blocks = [f"[source: {m['source']} chunk {m['chunk']}]\n{d}" for d, m in zip(docs, metas)]
     context_blocks = trim_context(context_blocks, max_chars=3500)
     context = "\n\n---\n\n".join(context_blocks)
@@ -237,7 +220,6 @@ def answer_question(question: str) -> str:
     ]
     answer = ollama_chat(messages)
 
-    # Append Sources (ensure they’re visible even if model forgets)
     used_sources = []
     for line in context.splitlines():
         if line.startswith("[source: "):
@@ -250,10 +232,34 @@ def answer_question(question: str) -> str:
     return answer
 
 # =======================
+# Prediction wiring
+# =======================
+def run_prediction_from_json(json_str: str) -> str:
+    if predict_from_features is None:
+        return ("Prediction hook not set. Create models/predict.py with "
+                "`predict_from_features(features: dict) -> dict`, and make sure models/model.pkl exists.")
+    try:
+        features = json.loads(json_str)
+        if not isinstance(features, dict):
+            raise ValueError("JSON must be an object with feature: value pairs.")
+    except Exception as e:
+        return ('Invalid JSON after /predict.\n'
+                'Example: /predict {"B365H":1.9,"B365D":3.2,"B365A":3.9,"AvgH":2.0,"AvgD":3.3,"AvgA":3.6,"PSH":1.95,"PSD":3.4,"PSA":3.7,"Avg>2.5":1.95,"Avg<2.5":1.85,"AHCh":-0.5}\n'
+                f'Error: {e}')
+    try:
+        result = predict_from_features(features)
+    except Exception as e:
+        return f"Prediction error: {e}"
+    return "Prediction:\n" + json.dumps(result, indent=2)
+
+# =======================
 # Interactive Chat
 # =======================
 def chat():
     print("Local RAG chat. Type /exit to quit.")
+    print("Commands:")
+    print("  • Ask normally for doc Q&A")
+    print("  • /predict {JSON}  → run your ML model with features JSON")
     while True:
         try:
             q = input("\nYou > ").strip()
@@ -264,6 +270,10 @@ def chat():
             continue
         if q.lower() in ("/exit", "/quit"):
             break
+        if q.startswith("/predict"):
+            json_part = q[len("/predict"):].strip()
+            print("\nPREDICT >", run_prediction_from_json(json_part))
+            continue
         try:
             ans = answer_question(q)
             print("\nRAG >", ans)
@@ -279,6 +289,7 @@ if __name__ == "__main__":
     parser.add_argument("--build", action="store_true", help="(Re)build index from docs/")
     parser.add_argument("--ask", type=str, help="Ask a question against the local index")
     parser.add_argument("--chat", action="store_true", help="Interactive local chat (RAG)")
+    parser.add_argument("--predict", type=str, help='Run prediction with a JSON string, e.g. --predict "{\"B365H\":1.9, ...}"')
     args = parser.parse_args()
 
     if args.build:
@@ -288,6 +299,9 @@ if __name__ == "__main__":
     if args.ask:
         print("\nQ:", args.ask)
         print("\nA:", answer_question(args.ask))
+
+    if args.predict:
+        print(run_prediction_from_json(args.predict))
 
     if args.chat:
         chat()
